@@ -9,9 +9,11 @@ import shutil
 import zipfile
 import requests
 import datetime
+import time
 from tqdm import tqdm
 from pathlib import Path
 from loguru import logger
+from typing import Union
 from qlib.utils import exists_qlib_data
 
 
@@ -41,9 +43,9 @@ class GetData:
         """
         return f"{self.REMOTE_URL}/{file_name}" if "/" in file_name else f"{self.REMOTE_URL}/v0/{file_name}"
 
-    def download(self, url: str, target_path: [Path, str]):
+    def download(self, url: str, target_path: Union[Path, str]):
         """
-        Download a file from the specified url.
+        Download a file from the specified url with improved buffering, retry mechanism, and resume capability.
 
         Parameters
         ----------
@@ -53,23 +55,100 @@ class GetData:
             The location where the data is saved, including the file name.
         """
         file_name = str(target_path).rsplit("/", maxsplit=1)[-1]
-        resp = requests.get(url, stream=True, timeout=60)
-        resp.raise_for_status()
-        if resp.status_code != 200:
-            raise requests.exceptions.HTTPError()
+        target_path = Path(target_path)
+        
+        # Retry configuration
+        max_retries = 50  # Much higher retries for large files prone to interruption
+        retry_delay = 3  # Fixed 3 seconds delay
+        
+        # Check for partial download and get resume position
+        resume_pos = 0
+        if target_path.exists():
+            resume_pos = target_path.stat().st_size
+            logger.info(f"Found partial download of {resume_pos:,} bytes, attempting to resume...")
+        
+        for attempt in range(max_retries):
+            try:
+                # Use session for connection pooling and better performance
+                session = requests.Session()
+                
+                # Set headers for resume capability
+                headers = {}
+                if resume_pos > 0:
+                    headers['Range'] = f'bytes={resume_pos}-'
+                
+                # Set larger timeout and configure session
+                resp = session.get(url, stream=True, timeout=120, headers=headers)
+                resp.raise_for_status()
+                
+                # Handle partial content response
+                if resp.status_code == 206:  # Partial Content
+                    logger.info(f"Server supports resume, continuing from byte {resume_pos:,}")
+                elif resp.status_code == 200 and resume_pos > 0:
+                    # Server doesn't support resume, restart download
+                    logger.warning("Server doesn't support resume, restarting download from beginning")
+                    resume_pos = 0
+                    if target_path.exists():
+                        target_path.unlink()
+                
+                # Increase chunk size significantly for better performance
+                chunk_size = 256 * 1024  # 256KB chunks for even better performance
+                
+                if attempt == 0:  # Only show warning on first attempt
+                    logger.warning(
+                        f"The data for the example is collected from Yahoo Finance. Please be aware that the quality of the data might not be perfect. (You can refer to the original data source: https://finance.yahoo.com/lookup.)"
+                    )
+                
+                logger.info(f"{os.path.basename(file_name)} downloading... (attempt {attempt + 1}/{max_retries})")
+                
+                # Calculate total size accounting for resume
+                if resp.status_code == 206:
+                    # For partial content, get total size from Content-Range header
+                    content_range = resp.headers.get('Content-Range', '')
+                    if content_range:
+                        total_size = int(content_range.split('/')[-1])
+                    else:
+                        total_size = resume_pos + int(resp.headers.get("Content-Length", 0))
+                else:
+                    total_size = int(resp.headers.get("Content-Length", 0))
+                
+                downloaded_size = resume_pos
+                
+                with tqdm(total=total_size, initial=resume_pos, unit='B', unit_scale=True, desc=os.path.basename(file_name)) as p_bar:
+                    # Use append mode if resuming, write mode otherwise
+                    file_mode = "ab" if resume_pos > 0 else "wb"
+                    
+                    # Use larger buffer size for file writing (2MB buffer)
+                    with target_path.open(file_mode, buffering=2*1024*1024) as fp:
+                        for chunk in resp.iter_content(chunk_size=chunk_size):
+                            if chunk:  # Filter out keep-alive chunks
+                                fp.write(chunk)
+                                downloaded_size += len(chunk)
+                                p_bar.update(len(chunk))
+                
+                session.close()
+                logger.info(f"Successfully downloaded {os.path.basename(file_name)} ({downloaded_size:,} bytes)")
+                return  # Success, exit retry loop
+                
+            except (requests.exceptions.RequestException, requests.exceptions.ChunkedEncodingError, 
+                    requests.exceptions.ConnectionError, IOError) as e:
+                if 'session' in locals():
+                    session.close()
+                    
+                # Update resume position for next attempt
+                if target_path.exists():
+                    resume_pos = target_path.stat().st_size
+                    logger.info(f"Download interrupted at {resume_pos:,} bytes")
+                
+                if attempt < max_retries - 1:
+                    logger.warning(f"Download attempt {attempt + 1} failed: {str(e)}. Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    # Keep retry delay fixed at 3 seconds instead of exponential backoff
+                else:
+                    logger.error(f"All {max_retries} download attempts failed. Last error: {str(e)}")
+                    raise
 
-        chunk_size = 1024
-        logger.warning(
-            f"The data for the example is collected from Yahoo Finance. Please be aware that the quality of the data might not be perfect. (You can refer to the original data source: https://finance.yahoo.com/lookup.)"
-        )
-        logger.info(f"{os.path.basename(file_name)} downloading......")
-        with tqdm(total=int(resp.headers.get("Content-Length", 0))) as p_bar:
-            with target_path.open("wb") as fp:
-                for chunk in resp.iter_content(chunk_size=chunk_size):
-                    fp.write(chunk)
-                    p_bar.update(chunk_size)
-
-    def download_data(self, file_name: str, target_dir: [Path, str], delete_old: bool = True):
+    def download_data(self, file_name: str, target_dir: Union[Path, str], delete_old: bool = True):
         """
         Download the specified file to the target folder.
 
@@ -117,7 +196,7 @@ class GetData:
         return status
 
     @staticmethod
-    def _unzip(file_path: [Path, str], target_dir: [Path, str], delete_old: bool = True):
+    def _unzip(file_path: Union[Path, str], target_dir: Union[Path, str], delete_old: bool = True):
         file_path = Path(file_path)
         target_dir = Path(target_dir)
         if delete_old:
@@ -127,8 +206,19 @@ class GetData:
             GetData._delete_qlib_data(target_dir)
         logger.info(f"{file_path} unzipping......")
         with zipfile.ZipFile(str(file_path.resolve()), "r") as zp:
-            for _file in tqdm(zp.namelist()):
-                zp.extract(_file, str(target_dir.resolve()))
+            # Get total number of files for progress tracking
+            file_list = zp.namelist()
+            total_files = len(file_list)
+            
+            # Use extractall for better performance with large files
+            if total_files > 100:
+                # For large archives, use extractall which is more efficient
+                logger.info(f"Extracting {total_files} files using optimized batch extraction...")
+                zp.extractall(str(target_dir.resolve()))
+            else:
+                # For smaller archives, maintain progress tracking
+                for _file in tqdm(file_list, desc="Extracting"):
+                    zp.extract(_file, str(target_dir.resolve()))
 
     @staticmethod
     def _delete_qlib_data(file_dir: Path):
